@@ -788,7 +788,7 @@ module Cassandra
       end
 
       def read_bigint(buffer, with_size = true)
-        read_size(buffer) if with_size
+        read_size(buffer) || return if with_size
         buffer.read_long
       end
 
@@ -813,17 +813,17 @@ module Cassandra
       end
 
       def read_double(buffer, with_size = true)
-        read_size(buffer) if with_size
+        read_size(buffer) || return if with_size
         buffer.read_double
       end
 
       def read_float(buffer, with_size = true)
-        read_size(buffer) if with_size
+        read_size(buffer) || return if with_size
         buffer.read_float
       end
 
       def read_int(buffer, with_size = true)
-        read_size(buffer) if with_size
+        read_size(buffer) || return if with_size
         buffer.read_signed_int
       end
 
@@ -857,12 +857,12 @@ module Cassandra
       end
 
       def read_tinyint(buffer, with_size = true)
-        read_size(buffer) if with_size
+        read_size(buffer) || return if with_size
         buffer.read_tinyint
       end
 
       def read_smallint(buffer, with_size = true)
-        read_size(buffer) if with_size
+        read_size(buffer) || return if with_size
         buffer.read_smallint
       end
 
