@@ -40,7 +40,7 @@ module Cassandra
       describe '#to_s' do
         it 'returns a pretty string' do
           request = CredentialsRequest.new('foo' => 'bar', 'hello' => 'world')
-          request.to_s.should == 'CREDENTIALS {"foo"=>"bar", "hello"=>"world"}'
+          request.to_s.gsub(" => ", "=>").should == 'CREDENTIALS {"foo"=>"bar", "hello"=>"world"}'
         end
       end
 
