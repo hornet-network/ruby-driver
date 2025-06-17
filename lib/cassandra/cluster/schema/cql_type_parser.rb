@@ -85,16 +85,16 @@ module Cassandra
         end
 
         def parse_node(string)
-          root = node = Node.new(nil, '', [])
+          root = node = Node.new(nil, +'', [])
 
           string.each_char do |char|
             case char
             when '<' # starting type params
-              child = Node.new(node, '', [])
+              child = Node.new(node, +'', [])
               node.children << child
               node = child
             when ','
-              child = Node.new(node.parent, '', [])
+              child = Node.new(node.parent, +'', [])
               node.parent.children << child
               node = child
             when '>'

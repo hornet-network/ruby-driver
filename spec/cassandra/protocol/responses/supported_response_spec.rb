@@ -25,7 +25,7 @@ module Cassandra
       describe '#to_s' do
         it 'returns a string with the options' do
           response = described_class.new('CQL_VERSION' => ['3.0.0'], 'COMPRESSION' => [])
-          response.to_s.should == 'SUPPORTED {"CQL_VERSION"=>["3.0.0"], "COMPRESSION"=>[]}'
+          response.to_s.gsub(" => ", "=>").should == 'SUPPORTED {"CQL_VERSION"=>["3.0.0"], "COMPRESSION"=>[]}'
         end
       end
     end

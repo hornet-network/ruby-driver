@@ -51,7 +51,7 @@ module Cassandra
       describe '#to_s' do
         it 'returns a pretty string' do
           request = StartupRequest.new('3.0.0')
-          request.to_s.should == 'STARTUP {"CQL_VERSION"=>"3.0.0"}'
+          request.to_s.gsub(" => ", "=>").should == 'STARTUP {"CQL_VERSION"=>"3.0.0"}'
         end
       end
     end
