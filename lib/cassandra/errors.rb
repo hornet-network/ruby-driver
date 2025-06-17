@@ -761,7 +761,7 @@ module Cassandra
       def initialize(errors = nil)
         if errors
           first   = true
-          message = 'All attempted hosts failed'
+          message = +'All attempted hosts failed'
           errors.each do |(host, error)|
             if first
               first = false

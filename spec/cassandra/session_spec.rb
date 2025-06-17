@@ -143,7 +143,7 @@ module Cassandra
           bound_statement = double('bound statement')
           options         = double('options')
 
-          expect(session_options).to receive(:override).once.with(nil, arguments: [1, 2, 3, 4, 5]).and_return(options)
+          expect(session_options).to receive(:override).once.with(nil, {arguments: [1, 2, 3, 4, 5]}).and_return(options)
           allow(options).to receive(:arguments).and_return([1, 2, 3, 4, 5])
           expect(statement).to receive(:bind).with([1, 2, 3, 4, 5]).and_return(bound_statement)
           expect(client).to receive(:execute).once.with(bound_statement, options).and_return(promise)
