@@ -12,7 +12,8 @@ Try to write a test case and include it in your report (have a look at the
 [regression test suite](spec/regressions) if you need inspiration).
 
 1. Bundle with `bundle install`
-1. Run the unit test suite with `rake rspec`
+2. Compile native extension with `rake compile`
+3. Run the unit test suite with `rake rspec`
   * Using this rake task will install necessary ruby extensions as a prerequisite
   * For `bundle exec rspec` to be successful, run `bundle exec rake compile` once, beforehand
 

@@ -16,6 +16,7 @@
 # limitations under the License.
 #++
 
+Warning[:deprecated] = true # Enable ruby deprecation warnings
 ENV['CASSANDRA_HOST'] ||= '127.0.0.1'
 
 require 'bundler/setup'

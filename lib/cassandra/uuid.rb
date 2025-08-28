@@ -26,9 +26,9 @@ module Cassandra
   #
   class Uuid
     # @private
-    RAW_FORMAT = '%032x'.force_encoding(Encoding::ASCII).freeze
+    RAW_FORMAT = String.new('%032x').force_encoding(Encoding::ASCII).freeze
     # @private
-    HYPHEN = '-'.force_encoding(Encoding::ASCII).freeze
+    HYPHEN = String.new('-').force_encoding(Encoding::ASCII).freeze
     # @private
     EMPTY_STRING = ''.freeze
 

@@ -310,7 +310,7 @@ module Cassandra
         end
 
         it 'decodes a string' do
-          buffer.read_string.should == 'hej och hå'.force_encoding(::Encoding::UTF_8)
+          buffer.read_string.should == +'hej och hå'.force_encoding(::Encoding::UTF_8)
         end
 
         it 'decodes a string as UTF-8' do
@@ -336,7 +336,7 @@ module Cassandra
 
       describe '#read_long_string' do
         let :buffer do
-          described_class.new("\x00\x01\x00\00" << ('x' * 0x10000))
+          described_class.new(+"\x00\x01\x00\00" << ('x' * 0x10000))
         end
 
         it 'decodes a string' do
@@ -415,11 +415,11 @@ module Cassandra
 
       describe '#read_bytes' do
         let :buffer do
-          described_class.new("\x00\x01\x00\x00" << ("\x42" * 0x10000))
+          described_class.new(+"\x00\x01\x00\x00" << ("\x42" * 0x10000))
         end
 
         it 'decodes a byte array' do
-          buffer.read_bytes.should eql_bytes("\x42" * 0x10000)
+          buffer.read_bytes.should eql_bytes(+"\x42" * 0x10000)
         end
 
         it 'decodes an empty byte array' do
@@ -446,11 +446,11 @@ module Cassandra
 
       describe '#read_short_bytes' do
         let :buffer do
-          described_class.new("\x01\x00" << ("\x42" * 0x100))
+          described_class.new(+"\x01\x00" << ("\x42" * 0x100))
         end
 
         it 'decodes a byte array' do
-          buffer.read_short_bytes.should eql_bytes("\x42" * 0x100)
+          buffer.read_short_bytes.should eql_bytes(+"\x42" * 0x100)
         end
 
         it 'decodes an empty byte array' do
@@ -769,7 +769,7 @@ module Cassandra
       describe '#append_bytes' do
         it 'encodes a byte array' do
           buffer.append_bytes("\xaa" * 2000)
-          buffer.should eql_bytes("\x00\x00\x07\xd0" << ("\xaa" * 2000))
+          buffer.should eql_bytes(+"\x00\x00\x07\xd0" << ("\xaa" * 2000))
         end
 
         it 'encodes a string with multibyte characters' do

@@ -32,7 +32,7 @@ module Cassandra
       describe '#to_s' do
         it 'returns a string with metadata and rows' do
           response = RowsResultResponse.new(nil, nil, [{'col' => 'foo'}], [['ks', 'tbl', 'col', :varchar]], nil, nil)
-          response.to_s.should == 'RESULT ROWS [["ks", "tbl", "col", :varchar]] [{"col"=>"foo"}]'
+          response.to_s.gsub(" => ", "=>").should == 'RESULT ROWS [["ks", "tbl", "col", :varchar]] [{"col"=>"foo"}]'
         end
       end
     end

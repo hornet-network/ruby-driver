@@ -209,7 +209,7 @@ module Cassandra
           end
 
           it 'decompresses response frames' do
-            id = "\xCAH\x7F\x1Ez\x82\xD2<N\x8A\xF35Qq\xA5/".force_encoding(::Encoding::BINARY)
+            id = +"\xCAH\x7F\x1Ez\x82\xD2<N\x8A\xF35Qq\xA5/".force_encoding(::Encoding::BINARY)
             compressor.stub(:decompress).with('FAKECOMPRESSEDBODY').and_return("\x00\x00\x00\x04" + "\x00\x10" + id + "\x00\x00\x00\x01\x00\x00\x00\x01\x00\ncql_rb_911\x00\x05users\x00\tuser_name\x00\r")
             f1 = protocol_handler.send_request(request)
             f2 = protocol_handler.send_request(request)
