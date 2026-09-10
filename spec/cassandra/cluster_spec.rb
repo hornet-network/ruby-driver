@@ -83,9 +83,24 @@ module Cassandra
       end
 
       it 'closes control connection' do
+        expect(io_reactor).not_to receive(:stop)
         expect(control_connection).to receive(:close_async).once.and_return(Ione::Future.resolved)
         expect(cluster.close_async).to eq(promise)
         expect(promise).to have_received(:fulfill).once.with(cluster)
+      end
+
+      it 'waits for the control connection to finish stopping the reactor' do
+        stopped = Ione::Promise.new
+        expect(io_reactor).to receive(:stop).once.and_return(stopped.future)
+        allow(executor).to receive(:shutdown)
+
+        cluster.close_async
+        expect(promise).not_to have_received(:fulfill)
+        expect(executor).not_to have_received(:shutdown)
+
+        stopped.fulfill
+        expect(promise).to have_received(:fulfill).once.with(cluster)
+        expect(executor).to have_received(:shutdown).once
       end
     end
 

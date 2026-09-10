@@ -8,7 +8,11 @@ Bug Fixes:
 * The reactor sleeps until there is IO, a timer is due or it is unblocked, instead of waking every second, and evicts sockets whose file descriptor was closed underneath it.
 * The reactor thread is named `io_reactor` so leaked reactors can be counted per process.
 * `Reconnection::Policies::Exponential` accepts a `jitter:` fraction (e.g. `Exponential.new(1, 60, 2, jitter: 0.25)`) so a fleet of processes does not reconnect in lockstep; the ceiling is always honoured.
-* Requires ione 1.3.
+* Reactor restarts restore the wake-up pipe; shutdown drains use a fixed tick even when timers are overdue.
+* Connection attempts sleep until their nearest deadline, and timers scheduled on the reactor thread avoid redundant wake-ups.
+* `connect_timeout: Float::INFINITY` continues to allow unbounded TCP connects and TLS handshakes.
+* Reconnection jitter samples within the bounded window, avoiding a concentration of retries at the maximum interval.
+* Requires ione 1.3.x (`~> 1.3.0`).
 
 # 3.2.5
 Bug Fixes:

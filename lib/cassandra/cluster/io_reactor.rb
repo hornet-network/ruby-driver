@@ -47,8 +47,20 @@ module Cassandra
 
       def initialize(options = {})
         super
+        @unblocker.close
+        @unblocker = Unblocker.new
         @scheduler = Scheduler.new(@options)
         @io_loop   = IoLoop.new(@unblocker, @scheduler, @options)
+      end
+
+      def start
+        @lock.synchronize do
+          if (@state == STOPPED_STATE || @state == CRASHED_STATE) && @unblocker.closed?
+            @unblocker.reopen
+            @io_loop.add_socket(@unblocker)
+          end
+        end
+        super
       end
 
       # Same contract as {Ione::Io::IoReactor#connect}, but the connect timeout
@@ -62,8 +74,7 @@ module Cassandra
           ssl     = options[:ssl]
         end
 
-        deadline   = @clock.now + timeout
-        connection = Ione::Io::Connection.new(host, port, timeout, @unblocker, @clock)
+        connection = Connection.new(host, port, timeout, @unblocker, @clock)
         f = connection.connect
         @io_loop.add_socket(connection)
         @unblocker.unblock if running?
@@ -76,7 +87,7 @@ module Cassandra
                                             connection.to_io,
                                             @unblocker,
                                             ssl_context,
-                                            deadline,
+                                            connection.deadline,
                                             @clock)
             ff = upgraded.connect
             @io_loop.remove_socket(connection)
@@ -94,8 +105,40 @@ module Cassandra
       # while it is asleep has to wake it up.
       def schedule_timer(timeout)
         timer = super
-        @unblocker.unblock if running?
+        @unblocker.unblock if running? && @io_loop.thread != ::Thread.current
         timer
+      end
+
+      # @private
+      class Unblocker < Ione::Io::Unblocker
+        # Retain the object so connections queued before a restart also use
+        # the new pipe when they need to wake the reactor.
+        def reopen
+          initialize if closed?
+        end
+      end
+
+      # @private
+      class Connection < Ione::Io::Connection
+        attr_reader :deadline
+
+        def initialize(*args)
+          super
+          # Time cannot represent infinity; nil leaves the connect unbounded.
+          @deadline = @clock.now + @connection_timeout unless @connection_timeout == ::Float::INFINITY
+        end
+
+        def connect
+          return @connected_promise.future if closed?
+
+          if @deadline && !connected? && @clock.now >= @deadline
+            close(Ione::Io::ConnectionTimeoutError.new(
+                    "Could not connect to #{@host}:#{@port} within #{@connection_timeout}s"
+            ))
+            return @connected_promise.future
+          end
+          super
+        end
       end
 
       # @private
@@ -118,6 +161,8 @@ module Cassandra
 
       # @private
       class IoLoop < Ione::Io::IoLoopBody
+        attr_reader :thread
+
         def initialize(unblocker, scheduler, options = {})
           super(unblocker, options)
           @scheduler       = scheduler
@@ -126,9 +171,9 @@ module Cassandra
           @drain_timeout   = options[:drain_timeout] || 5
         end
 
-        # @param max_timeout [Numeric, nil] upper bound on how long to block in
-        #   select, regardless of timers
-        def tick(max_timeout = nil)
+        # @param timeout [Numeric, nil] fixed select timeout while draining;
+        #   otherwise derived from pending timers and connect deadlines
+        def tick(timeout = nil)
           name_thread
 
           readables  = []
@@ -152,20 +197,27 @@ module Cassandra
             writables << s if s.connecting? || s.writable?
           end
 
-          timeout = @scheduler.next_timeout
-          # Connect and handshake timeouts are checked from #connect, which only
-          # runs when the loop wakes up, so keep ticking while connecting.
-          timeout = [timeout, @tick_resolution].compact.min unless connecting.empty?
-          timeout = [timeout, max_timeout].compact.min if max_timeout
+          unless timeout
+            deadlines = connecting.map do |s|
+              if s.respond_to?(:deadline)
+                deadline = s.deadline
+                [deadline - @clock.now, 0].max if deadline
+              else
+                @tick_resolution
+              end
+            end
+            timeout = [@scheduler.next_timeout, *deadlines].compact.min
+          end
 
           begin
             r, w, _ = @selector.select(readables, writables, nil, timeout)
-            connecting.each(&:connect)
-            r && r.each {|s| s.read if s.connected?}
-            w && w.each(&:flush)
-          rescue ::IOError, ::Errno::EBADF => e
-            evict_dead_sockets(e)
+          rescue ::IOError, ::Errno::EBADF, ::TypeError => e
+            raise unless evict_dead_sockets(readables + writables, e)
+            return
           end
+          connecting.each(&:connect)
+          r && r.each {|s| s.read if s.connected?}
+          w && w.each(&:flush)
         end
 
         def drain_sockets
@@ -184,29 +236,42 @@ module Cassandra
         private
 
         def name_thread
-          thread = ::Thread.current
-          thread.name = THREAD_NAME if thread.name.nil?
+          @thread = ::Thread.current
+          @thread.name = THREAD_NAME if @thread.name.nil?
         end
 
         # select raised because a file descriptor in the set is closed. Close
         # and drop the offending sockets so the loop cannot spin on them.
-        def evict_dead_sockets(error)
-          @sockets.each do |s|
-            next if s.closed? || !s.is_a?(Ione::Io::BaseConnection)
-            io = s.to_io
-            next if io.nil? || !io.closed?
+        def evict_dead_sockets(sockets, error)
+          dead = sockets.uniq.select do |s|
+            next true if s.closed?
             begin
-              s.close(error)
+              io = s.to_io
+              next true if io.nil? || io.closed?
+              # A descriptor closed through another IO wrapper can still
+              # report closed? == false. Probe the actual descriptor.
+              ::IO.select([io], nil, nil, 0)
+              false
+            rescue ::IOError, ::Errno::EBADF, ::TypeError
+              true
+            end
+          end
+          dead.each do |s|
+            begin
+              s.is_a?(Ione::Io::BaseConnection) ? s.close(error) : s.close
             rescue
               nil
             end
           end
-          @lock.synchronize { @sockets = @sockets.reject(&:closed?) }
+          @lock.synchronize { @sockets = @sockets.reject {|s| s.closed? || dead.include?(s)} }
+          !dead.empty?
         end
       end
 
       # @private
       class SslConnection < Ione::Io::SslConnection
+        attr_reader :deadline
+
         def initialize(host, port, io, unblocker, ssl_context, deadline, clock)
           super(host, port, io, unblocker, ssl_context)
           @deadline   = deadline
@@ -221,6 +286,10 @@ module Cassandra
         end
 
         def connect
+          return @connected_promise.future if closed?
+          fail_if_past_deadline
+          return @connected_promise.future if closed?
+
           if @io.nil?
             @io = if @ssl_context
                     @socket_impl.new(@raw_io, @ssl_context)
@@ -253,7 +322,7 @@ module Cassandra
             # The SSL socket closes the raw socket when it exists (sync_close),
             # but a handshake that never started leaves only the raw socket.
             begin
-              @raw_io.close unless @raw_io.closed?
+              @raw_io.close if @raw_io && !@raw_io.closed?
             rescue ::SystemCallError, ::IOError
               nil
             end
@@ -264,7 +333,7 @@ module Cassandra
         private
 
         def fail_if_past_deadline
-          return if @clock.now < @deadline
+          return if @deadline.nil? || @clock.now < @deadline
           close(Ione::Io::ConnectionTimeoutError.new(
                   "Could not complete TLS handshake with #{@host}:#{@port} " \
                   'within the connect timeout'

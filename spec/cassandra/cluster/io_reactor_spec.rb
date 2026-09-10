@@ -47,9 +47,9 @@ module Cassandra
 
       after do
         begin
-          reactor.stop.value
+          ::Timeout.timeout(3) { reactor.stop.value }
         rescue
-          nil
+          reactor.instance_variable_get(:@io_loop).thread.kill if reactor.running?
         end
       end
 
@@ -74,6 +74,50 @@ module Cassandra
           reactor.stop.value
           await { ::Thread.list.size <= before }
           expect(reactor_threads).to be_empty
+        end
+
+        it 'wakes for timers and stops after repeated restarts' do
+          ::Timeout.timeout(3) do
+            3.times do
+              reactor.start.value
+              reactor.schedule_timer(0.01).value
+              reactor.stop.value
+            end
+          end
+          expect(reactor_threads).to be_empty
+        end
+
+        it 'restarts when start is requested while stopping' do
+          ::Timeout.timeout(3) do
+            reactor.start.value
+            restarted = reactor.schedule_timer(0).flat_map do
+              reactor.stop
+              reactor.start
+            end
+            expect(restarted.value).to eq(reactor)
+            reactor.schedule_timer(0.01).value
+            reactor.stop.value
+          end
+        end
+
+        it 'restores the unblocker after a reactor crash' do
+          crashed = Ione::Promise.new
+          reactor.on_error {|error| crashed.fulfill(error)}
+          allow(selector).to receive(:select).and_wrap_original do |original, *args|
+            if crashed.future.completed?
+              original.call(*args)
+            else
+              raise 'selector failure'
+            end
+          end
+
+          ::Timeout.timeout(3) do
+            reactor.start.value
+            expect(crashed.future.value.message).to eq('selector failure')
+            reactor.start.value
+            reactor.schedule_timer(0.01).value
+            reactor.stop.value
+          end
         end
       end
 
@@ -105,6 +149,19 @@ module Cassandra
           await { selector.timeouts.last && selector.timeouts.last <= 0.2 }
           expect(selector.timeouts.last).to be > 0
         end
+
+        it 'does not wake itself when scheduling a timer on the reactor thread' do
+          reactor.start.value
+          await { selector.calls > 0 }
+          unblocker = reactor.instance_variable_get(:@unblocker)
+          allow(unblocker).to receive(:unblock).and_call_original
+
+          ::Timeout.timeout(3) do
+            reactor.schedule_timer(0).flat_map { reactor.schedule_timer(0.01) }.value
+          end
+
+          expect(unblocker).to have_received(:unblock).once
+        end
       end
 
       describe('TLS handshake') do
@@ -122,7 +179,7 @@ module Cassandra
             accepted = server.accept
 
             expect { future.value }.to raise_error(Ione::Io::ConnectionTimeoutError, /TLS handshake/)
-            expect(::Time.now - started).to be < 3
+            expect(::Time.now - started).to be < 1
 
             # the half-open socket is closed, not left in the loop: reading
             # drains the ClientHello and then hits EOF instead of blocking
@@ -145,6 +202,25 @@ module Cassandra
             # the stock reactor selects the socket for writability, which
             # returns immediately, and goes round tens of thousands of times
             expect(selector.calls).to be < 20
+          end
+
+          it 'keeps an infinite timeout pending while allowing timers and shutdown' do
+            accepted = nil
+            ::Timeout.timeout(3) do
+              reactor.start.value
+              future = reactor.connect('127.0.0.1', port, timeout: Float::INFINITY, ssl: true)
+              accepted = server.accept
+
+              reactor.schedule_timer(0.05).value
+              expect(future).not_to be_completed
+              expect(selector.calls).to be < 20
+
+              reactor.stop.value
+              expect(future).to be_completed
+              expect(accepted.read).not_to be_empty
+            end
+          ensure
+            accepted.close if accepted
           end
         end
 
@@ -206,6 +282,206 @@ module Cassandra
           expect { future.value }.to raise_error(Ione::Io::ConnectionError)
           expect(::Time.now - started).to be < 2
         end
+
+        it 'can write through a connection queued before restarting' do
+          server = ::TCPServer.new('127.0.0.1', 0)
+          reactor.start.value
+          reactor.stop.value
+          connected = reactor.connect('127.0.0.1', server.addr[1], timeout: 1)
+          accepted = server.accept
+
+          ::Timeout.timeout(3) do
+            reactor.start.value
+            connected.value.write('hello')
+            expect(accepted.read(5)).to eq('hello')
+            reactor.stop.value
+          end
+        ensure
+          accepted.close if accepted
+          server.close if server
+        end
+
+        it 'connects and writes with an infinite timeout' do
+          accepted = nil
+          server = ::TCPServer.new('127.0.0.1', 0)
+          ::Timeout.timeout(3) do
+            reactor.start.value
+            connection = reactor.connect('127.0.0.1', server.addr[1], Float::INFINITY).value
+            accepted = server.accept
+            connection.write('hello')
+            expect(accepted.read(5)).to eq('hello')
+          end
+        ensure
+          accepted.close if accepted
+          server.close if server
+        end
+      end
+    end
+
+    describe(IoReactor::IoLoop) do
+      let(:clock) { double('clock', now: 100.0) }
+      let(:selector) { double('selector') }
+      let(:unblocker) { IoReactor::Unblocker.new }
+      let(:scheduler) { IoReactor::Scheduler.new(clock: clock) }
+      let(:io_loop) do
+        IoReactor::IoLoop.new(unblocker, scheduler,
+                             clock: clock, selector: selector, tick_resolution: 1, drain_timeout: 3)
+      end
+
+      before { @thread_name = ::Thread.current.name }
+      after do
+        io_loop.close_sockets
+        ::Thread.current.name = @thread_name
+      end
+
+      it 'uses a fixed timeout while draining with an overdue timer' do
+        timer = scheduler.schedule_timer(-1)
+        socket = double('socket', connected?: false, connecting?: false,
+                                  writable?: true, closed?: false, drain: nil, close: nil)
+        io_loop.add_socket(socket)
+        now = 100.0
+        allow(selector).to receive(:select) do |_, _, _, timeout|
+          expect(timeout).to eq(1)
+          now += timeout
+          allow(clock).to receive(:now).and_return(now)
+          nil
+        end
+
+        expect { io_loop.drain_sockets }.to raise_error(Ione::Io::ReactorError, /drain timeout/)
+        expect(selector).to have_received(:select).exactly(3).times
+        expect(timer).not_to be_completed
+      end
+
+      it 'selects only until the nearest connect deadline' do
+        [100.25, nil, 102.0].each do |deadline|
+          socket = double('connection', connected?: false, connecting?: true,
+                                        closed?: false, deadline: deadline, connect: nil, close: nil)
+          io_loop.add_socket(socket)
+        end
+        scheduler.schedule_timer(0.5)
+
+        expect(selector).to receive(:select).with(anything, anything, nil, 0.25)
+        io_loop.tick
+      end
+
+      it 'selects without a deadline for an infinite timeout' do
+        socket = double('connection', connected?: false, connecting?: true,
+                                      closed?: false, deadline: nil, connect: nil, close: nil)
+        io_loop.add_socket(socket)
+
+        expect(selector).to receive(:select).with(anything, anything, nil, nil)
+        io_loop.tick
+      end
+
+      it 'honours timers while a connection has an infinite timeout' do
+        socket = double('connection', connected?: false, connecting?: true,
+                                      closed?: false, deadline: nil, connect: nil, close: nil)
+        io_loop.add_socket(socket)
+        scheduler.schedule_timer(0.25)
+
+        expect(selector).to receive(:select).with(anything, anything, nil, 0.25)
+        io_loop.tick
+      end
+
+      it 'lets an earlier timer bound select while connecting' do
+        socket = double('connection', connected?: false, connecting?: true,
+                                      closed?: false, deadline: 105.0, connect: nil, close: nil)
+        io_loop.add_socket(socket)
+        scheduler.schedule_timer(0.1)
+
+        expect(selector).to receive(:select) do |_, _, _, timeout|
+          expect(timeout).to be_within(0.0001).of(0.1)
+          nil
+        end
+        io_loop.tick
+      end
+
+      def add_connection(io)
+        connection = Ione::Io::BaseConnection.new('127.0.0.1', 9042, unblocker)
+        connection.instance_variable_set(:@io, io)
+        connection.instance_variable_set(:@state, Ione::Io::BaseConnection::CONNECTED_STATE)
+        io_loop.add_socket(connection)
+        connection
+      end
+
+      [::IOError, ::Errno::EBADF, ::TypeError].each do |error_class|
+        it "evicts an invalid socket after #{error_class} and retains healthy sockets" do
+          reader, writer = ::IO.pipe
+          dead_io = reader.dup
+          dead = add_connection(dead_io)
+          healthy = add_connection(reader)
+          if error_class == ::IOError
+            dead_io.close
+          elsif error_class == ::Errno::EBADF
+            # Close the fd through another wrapper: closed? still returns false.
+            ::IO.for_fd(dead_io.fileno).close
+            expect(dead_io).not_to be_closed
+          else
+            dead_io.close
+            dead.instance_variable_set(:@io, nil)
+          end
+          expect { ::IO.select([dead], nil, nil, 0) }.to raise_error(error_class)
+          allow(selector).to receive(:select) do |*args|
+            ::IO.select(*args)
+          end
+
+          io_loop.tick
+
+          expect(dead).to be_closed
+          expect(healthy).not_to be_closed
+          received = nil
+          healthy.on_data {|data| received = data}
+          writer.write('hello')
+          io_loop.tick
+          expect(received).to eq('hello')
+        ensure
+          writer.close if writer
+          begin
+            dead_io.close if dead_io && !dead_io.closed?
+          rescue ::Errno::EBADF
+            nil
+          end
+        end
+      end
+
+      it 'propagates select errors unrelated to dead sockets' do
+        expect(selector).to receive(:select).and_raise(::TypeError, 'bad selector argument')
+        expect { io_loop.tick }.to raise_error(::TypeError, 'bad selector argument')
+      end
+    end
+
+    describe(IoReactor::Connection) do
+      it 'fails at the connect deadline without waiting for another polling tick' do
+        clock = double('clock', now: 100.0)
+        connection = IoReactor::Connection.new('127.0.0.1', 9042, 0.25, nil, clock)
+        allow(clock).to receive(:now).and_return(100.25)
+
+        expect { connection.connect.value }.to raise_error(Ione::Io::ConnectionTimeoutError)
+        expect(connection).to be_closed
+      end
+    end
+
+    describe(IoReactor::SslConnection) do
+      it 'fails the handshake without raising when the raw socket has disappeared' do
+        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, nil, nil, nil,
+                                                  ::Time.now + 1, ::Time)
+        future = connection.connect
+
+        expect(future).to be_failed
+        expect { future.value }.to raise_error(Ione::Io::ConnectionError)
+        expect(connection).to be_closed
+        expect(connection.close).to eq(false)
+      end
+
+      it 'closes the raw socket when closed before the handshake starts' do
+        reader, writer = ::IO.pipe
+        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, reader, nil, nil,
+                                                  ::Time.now + 1, ::Time)
+        expect(connection.close).to eq(true)
+        expect(reader).to be_closed
+      ensure
+        reader.close if reader && !reader.closed?
+        writer.close if writer
       end
     end
   end

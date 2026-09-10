@@ -55,8 +55,9 @@ module Cassandra
           def randomize(interval)
             return interval if @jitter.zero?
 
-            value = interval + interval * @jitter * (@random.rand * 2 - 1)
-            value > @max ? @max : value
+            lower = interval * (1 - @jitter)
+            upper = [interval * (1 + @jitter), @max].min
+            lower + (upper - lower) * @random.rand
           end
         end
 
@@ -66,7 +67,7 @@ module Cassandra
         # @param exponent [Numeric] (2) interval exponent to use
         # @param jitter   [Numeric] (0) fraction in `0...1` by which each
         #   interval is randomised, e.g. `0.25` for +/- 25%
-        # @param random   [#rand] (Random::DEFAULT) source of randomness for
+        # @param random   [#rand] (Random) source of randomness for
         #   jitter
         #
         # @raise [ArgumentError] if jitter is not in `0...1`
@@ -91,7 +92,11 @@ module Cassandra
         #   # ...
         #   schedule.next # somewhere in 45..60
         def initialize(start, max, exponent = 2, jitter: 0, random: ::Random)
-          jitter = Float(jitter)
+          begin
+            jitter = Float(jitter)
+          rescue ::TypeError, ::ArgumentError
+            raise ::ArgumentError, "jitter must be in 0...1, #{jitter.inspect} given"
+          end
           unless jitter >= 0 && jitter < 1
             raise ::ArgumentError, "jitter must be in 0...1, #{jitter.inspect} given"
           end

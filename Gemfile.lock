@@ -8,8 +8,8 @@ GIT
 PATH
   remote: .
   specs:
-    cassandra-driver (3.2.5)
-      ione (~> 1.3)
+    cassandra-driver (3.2.6)
+      ione (~> 1.3.0)
       sorted_set
 
 GEM

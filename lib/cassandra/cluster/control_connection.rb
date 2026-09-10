@@ -40,7 +40,7 @@ module Cassandra
         @schema_fetcher        = schema_fetcher
         @refreshing_statuses   = ::Hash.new(false)
         @refresh_schema_future = nil
-        @status                = :closed
+        @status                = :disconnected
         @refreshing_hosts      = false
         @refreshing_host       = ::Hash.new(false)
         @closed_promise        = Ione::Promise.new
@@ -59,6 +59,10 @@ module Cassandra
       def connect_async
         synchronize do
           return Ione::Future.resolved if @status == :connecting || @status == :connected
+          if @status == :closing
+            return Ione::Future.failed(Errors::ClientError.new('Control connection is closing'))
+          end
+          @closed_promise = Ione::Promise.new if @status == :closed
           @status = :connecting
         end
 
@@ -87,7 +91,7 @@ module Cassandra
           @io_reactor.cancel_timer(timer) if timer
 
           unless @connection ||
-                 (@status == :closing || @status == :closed) ||
+                 (@status == :disconnected || @status == :closing || @status == :closed) ||
                  @load_balancing_policy.distance(host) == :ignore
             return connect_to_first_available(
               @load_balancing_policy.plan(nil, VOID_STATEMENT, VOID_OPTIONS)
@@ -127,28 +131,27 @@ module Cassandra
       end
 
       def close_async
-        synchronize do
-          # The status starts out as :closed before the first connect, so it
-          # cannot be used on its own to tell whether closing already happened.
-          # Closing a never-connected control connection must still stop the
-          # reactor and resolve, otherwise the reactor thread leaks and
-          # Cluster#close blocks forever.
-          if @status == :closing || @closed_promise.future.completed?
+        promise = synchronize do
+          if @status == :closing || @status == :closed
             return @closed_promise.future
           end
           @status = :closing
+          @closed_promise
         end
         f = @io_reactor.stop
 
         f.on_value(&method(:connection_closed))
         f.on_failure(&method(:connection_closed))
 
-        @closed_promise.future
+        promise.future
       end
 
       def connection_closed(cause)
-        synchronize { @status = :closed }
-        @closed_promise.fulfill
+        promise = synchronize do
+          @status = :closed
+          @closed_promise
+        end
+        promise.fulfill
       end
 
       def inspect
@@ -641,9 +644,7 @@ Control connection failed and is unlikely to recover.
 
               synchronize do
                 if connection == @connection
-                  if @status == :closing
-                    @status = :closed
-                  else
+                  unless @status == :closing || @status == :closed
                     @status = :reconnecting
                     reconnect = true
                   end
