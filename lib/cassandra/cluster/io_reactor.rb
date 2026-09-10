@@ -54,13 +54,30 @@ module Cassandra
       end
 
       def start
-        @lock.synchronize do
-          if (@state == STOPPED_STATE || @state == CRASHED_STATE) && @unblocker.closed?
-            @unblocker.reopen
-            @io_loop.add_socket(@unblocker)
+        stopping = @lock.synchronize do
+          return @started_promise.future if @state == RUNNING_STATE
+
+          if @state == STOPPING_STATE
+            @stopped_promise.future
+          else
+            # Restore the pipe in the same transition that starts the reactor.
+            # Shutdown cannot close it between this check and a later #start.
+            if @unblocker.closed?
+              @unblocker.reopen
+              @io_loop.add_socket(@unblocker)
+            end
+            started = @started_promise = Ione::Promise.new
+            stopped = @stopped_promise = Ione::Promise.new
+            @error_listeners.each {|listener| stopped.future.on_failure(&listener)}
+            @state = RUNNING_STATE
+            ::Thread.start { run(started, stopped) }
+            return started.future
           end
         end
-        super
+
+        # A completed future runs its callbacks immediately, so subscribe only
+        # after releasing the state lock; restarting needs to acquire it again.
+        stopping.flat_map { start }.fallback { start }
       end
 
       # Same contract as {Ione::Io::IoReactor#connect}, but the connect timeout
@@ -107,6 +124,38 @@ module Cassandra
         timer = super
         @unblocker.unblock if running? && @io_loop.thread != ::Thread.current
         timer
+      end
+
+      private
+
+      def run(started, stopped)
+        error = nil
+        begin
+          started.fulfill(self)
+          while @state == RUNNING_STATE
+            @io_loop.tick
+            @scheduler.tick
+          end
+        rescue => e
+          error = e
+        ensure
+          begin
+            begin
+              @io_loop.drain_sockets
+            rescue => e
+              error ||= e
+            end
+            @io_loop.close_sockets
+            @scheduler.cancel_timers
+          rescue => e
+            error ||= e
+          ensure
+            @lock.synchronize { @state = error ? CRASHED_STATE : STOPPED_STATE }
+            # A new run may start as soon as the state lock is released. Finish
+            # this run's promise, and invoke its callbacks outside the lock.
+            error ? stopped.fail(error) : stopped.fulfill(self)
+          end
+        end
       end
 
       # @private

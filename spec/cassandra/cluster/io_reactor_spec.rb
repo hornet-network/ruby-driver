@@ -100,6 +100,66 @@ module Cassandra
           end
         end
 
+        it 'restarts when shutdown completes immediately after start observes stopping' do
+          entered_select = ::Queue.new
+          release_select = ::Queue.new
+          observed_stopping = ::Queue.new
+          resume_start = ::Queue.new
+          begin_start = ::Queue.new
+          requester = nil
+          first_select = true
+          paused_start = false
+
+          allow(selector).to receive(:select).and_wrap_original do |original, *args|
+            if first_select
+              first_select = false
+              entered_select << true
+              release_select.pop
+              nil
+            else
+              original.call(*args)
+            end
+          end
+
+          lock = reactor.instance_variable_get(:@lock)
+          allow(lock).to receive(:synchronize).and_wrap_original do |original, &block|
+            result = original.call(&block)
+            if ::Thread.current == requester && !paused_start
+              paused_start = true
+              observed_stopping << true
+              resume_start.pop
+            end
+            result
+          end
+
+          ::Timeout.timeout(3) do
+            reactor.start.value
+            entered_select.pop
+            stopped = reactor.stop
+            requester = ::Thread.new do
+              begin_start.pop
+              reactor.start
+            end
+            begin_start << true
+
+            # Let shutdown close the pipe after start releases the state lock,
+            # before it can continue starting or subscribe to the stop future.
+            observed_stopping.pop
+            release_select << true
+            stopped.value
+            resume_start << true
+
+            expect(requester.value.value).to eq(reactor)
+            reactor.schedule_timer(0.01).value
+            reactor.stop.value
+          end
+        ensure
+          release_select << true
+          resume_start << true
+          begin_start << true
+          requester.kill.join if requester && requester.alive?
+        end
+
         it 'restores the unblocker after a reactor crash' do
           crashed = Ione::Promise.new
           reactor.on_error {|error| crashed.fulfill(error)}
@@ -118,6 +178,47 @@ module Cassandra
             reactor.schedule_timer(0.01).value
             reactor.stop.value
           end
+        end
+
+        it 'completes the old stop future when a new run has already started' do
+          shutdown_finished = ::Queue.new
+          complete_stop = ::Queue.new
+          paused_completion = false
+          previous_thread = nil
+
+          ::Timeout.timeout(3) do
+            reactor.start.value
+            await { reactor.instance_variable_get(:@io_loop).thread }
+            previous_thread = reactor.instance_variable_get(:@io_loop).thread
+            lock = reactor.instance_variable_get(:@lock)
+            allow(lock).to receive(:synchronize).and_wrap_original do |original, &block|
+              result = original.call(&block)
+              if ::Thread.current == previous_thread &&
+                 reactor.instance_variable_get(:@state) == IoReactor::STOPPED_STATE &&
+                 !paused_completion
+                paused_completion = true
+                shutdown_finished << true
+                complete_stop.pop
+              end
+              result
+            end
+
+            old_stop = reactor.stop
+            shutdown_finished.pop
+            reactor.start.value
+            new_stop = reactor.instance_variable_get(:@stopped_promise).future
+            expect(old_stop).not_to be_completed
+            complete_stop << true
+
+            expect(old_stop.value).to eq(reactor)
+            expect(new_stop).not_to be_completed
+            reactor.schedule_timer(0.01).value
+            expect(reactor.stop).to equal(new_stop)
+            new_stop.value
+          end
+        ensure
+          complete_stop << true
+          previous_thread.join(1) if previous_thread
         end
       end
 
