@@ -1,3 +1,15 @@
+# 3.2.6
+Bug Fixes:
+* `Cluster#close` / `Cluster#close_async` now always stop the ione IO reactor, so a closed cluster can never leave its reactor thread behind.
+* Closing a cluster whose control connection never connected used to return a future that never resolved and left the reactor running; `ControlConnection#close_async` now stops the reactor in that state too.
+* The connect timeout now bounds the TLS handshake as well as the TCP connect. A peer that accepts TCP but never answers the handshake used to hang connects forever.
+* A TLS socket waiting for the server's handshake bytes is selected for readability. Selecting it for writability made the reactor spin at 100% CPU for as long as the handshake was pending.
+* Closing a TLS connection now closes the underlying TCP socket too, instead of leaking the file descriptor until GC.
+* The reactor sleeps until there is IO, a timer is due or it is unblocked, instead of waking every second, and evicts sockets whose file descriptor was closed underneath it.
+* The reactor thread is named `io_reactor` so leaked reactors can be counted per process.
+* `Reconnection::Policies::Exponential` accepts a `jitter:` fraction (e.g. `Exponential.new(1, 60, 2, jitter: 0.25)`) so a fleet of processes does not reconnect in lockstep; the ceiling is always honoured.
+* Requires ione 1.3.
+
 # 3.2.5
 Bug Fixes:
 * [RUBY-293](https://datastax-oss.atlassian.net/browse/RUBY-293) Infinite loop when connecting with allow_beta_protocol

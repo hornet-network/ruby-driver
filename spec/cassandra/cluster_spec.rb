@@ -107,5 +107,61 @@ module Cassandra
         end
       end
     end
+
+    # Regression specs for closed and failed clusters releasing their reactor
+    # threads. These use a real reactor and only touch loopback sockets opened
+    # by the spec.
+    context('with a real io reactor') do
+      def free_port
+        server = ::TCPServer.new('127.0.0.1', 0)
+        port   = server.addr[1]
+        server.close
+        port
+      end
+
+      def reactor_threads
+        ::Thread.list.select {|t| t.name == Cluster::IoReactor::THREAD_NAME}
+      end
+
+      describe('#close') do
+        it 'stops the reactor thread and the executor threads' do
+          before  = ::Thread.list.size
+          driver  = Driver.new(io_reactor: Cluster::IoReactor.new)
+          cluster = driver.cluster
+
+          driver.io_reactor.start.value
+          await { reactor_threads.size == 1 }
+          expect(::Thread.list.size).to be > before
+
+          cluster.close
+
+          await { ::Thread.list.size <= before }
+          expect(reactor_threads).to be_empty
+        end
+
+        it 'can be called more than once' do
+          driver  = Driver.new(io_reactor: Cluster::IoReactor.new)
+          cluster = driver.cluster
+          driver.io_reactor.start.value
+
+          expect(cluster.close).to eq(cluster)
+          expect(cluster.close).to eq(cluster)
+          expect(reactor_threads).to be_empty
+        end
+      end
+
+      describe('Cassandra.cluster') do
+        it 'leaves no threads behind when no host can be reached' do
+          before = ::Thread.list.size
+
+          expect do
+            Cassandra.cluster(hosts: ['127.0.0.1'], port: free_port, connect_timeout: 1, timeout: 1)
+          end.to raise_error(Errors::NoHostsAvailable)
+
+          await { ::Thread.list.size <= before }
+          expect(reactor_threads).to be_empty
+        end
+      end
+    end
   end
 end

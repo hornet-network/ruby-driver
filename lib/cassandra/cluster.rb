@@ -286,13 +286,18 @@ module Cassandra
       promise = @futures.promise
 
       @control_connection.close_async.on_complete do |f|
-        if f.resolved?
-          promise.fulfill(self)
-        else
-          f.on_failure {|e| promise.break(e)}
-        end
+        # The control connection stops the reactor as part of closing, but stop
+        # it here as well so that a closed cluster can never leave its reactor
+        # thread behind, whatever state the control connection was in.
+        @io_reactor.stop.on_complete do |_|
+          if f.resolved?
+            promise.fulfill(self)
+          else
+            f.on_failure {|e| promise.break(e)}
+          end
 
-        @executor.shutdown
+          @executor.shutdown
+        end
       end
 
       promise.future
@@ -325,6 +330,7 @@ require 'cassandra/cluster/connection_pool'
 require 'cassandra/cluster/connector'
 require 'cassandra/cluster/control_connection'
 require 'cassandra/cluster/failed_connection'
+require 'cassandra/cluster/io_reactor'
 require 'cassandra/cluster/metadata'
 require 'cassandra/cluster/options'
 require 'cassandra/cluster/registry'

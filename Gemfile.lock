@@ -9,7 +9,7 @@ PATH
   remote: .
   specs:
     cassandra-driver (3.2.5)
-      ione
+      ione (~> 1.3)
       sorted_set
 
 GEM

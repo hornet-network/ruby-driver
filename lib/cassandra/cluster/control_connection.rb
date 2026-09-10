@@ -128,7 +128,14 @@ module Cassandra
 
       def close_async
         synchronize do
-          return @closed_promise.future if @status == :closing || @status == :closed
+          # The status starts out as :closed before the first connect, so it
+          # cannot be used on its own to tell whether closing already happened.
+          # Closing a never-connected control connection must still stop the
+          # reactor and resolve, otherwise the reactor thread leaks and
+          # Cluster#close blocks forever.
+          if @status == :closing || @closed_promise.future.completed?
+            return @closed_promise.future
+          end
           @status = :closing
         end
         f = @io_reactor.stop
@@ -140,6 +147,7 @@ module Cassandra
       end
 
       def connection_closed(cause)
+        synchronize { @status = :closed }
         @closed_promise.fulfill
       end
 
