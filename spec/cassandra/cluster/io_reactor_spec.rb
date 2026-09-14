@@ -263,6 +263,73 @@ module Cassandra
 
           expect(unblocker).to have_received(:unblock).once
         end
+
+        [:close, :drain].each do |operation|
+          it "wakes when an outgoing connection receives #{operation} from another thread" do
+            server = ::TCPServer.new('127.0.0.1', 0)
+            reactor.start.value
+            connection = reactor.connect('127.0.0.1', server.addr[1], 1).value
+            accepted = server.accept
+            unblocker = reactor.instance_variable_get(:@unblocker)
+            events = []
+            allow(unblocker).to receive(:unblock).and_wrap_original do |original|
+              events << :wakeup
+              original.call
+            end
+            connection.on_closed { events << :closed }
+            sleep(0.1)
+            calls = selector.calls
+
+            connection.public_send(operation)
+
+            expect(unblocker).to have_received(:unblock)
+            expect(events.index(:wakeup)).to be < events.index(:closed)
+            await { selector.calls > calls }
+            expect(::Timeout.timeout(2) { accepted.read }).to eq('')
+          ensure
+            accepted.close if accepted && !accepted.closed?
+            server.close if server && !server.closed?
+          end
+
+          it "releases a listening port when its acceptor receives #{operation}" do
+            reactor.start.value
+            acceptor = reactor.bind('127.0.0.1', 0, 5).value
+            port = acceptor.to_io.local_address.ip_port
+            unblocker = reactor.instance_variable_get(:@unblocker)
+            allow(unblocker).to receive(:unblock).and_call_original
+            sleep(0.1)
+            calls = selector.calls
+
+            acceptor.public_send(operation)
+
+            expect(unblocker).to have_received(:unblock)
+            await { selector.calls > calls }
+            rebound = ::TCPServer.new('127.0.0.1', port)
+          ensure
+            rebound.close if rebound
+          end
+
+          it "wakes when an accepted connection receives #{operation} from another thread" do
+            reactor.start.value
+            acceptor = reactor.bind('127.0.0.1', 0, 5).value
+            accepted = Ione::Promise.new
+            acceptor.on_accept {|connection| accepted.fulfill(connection)}
+            peer = ::TCPSocket.new('127.0.0.1', acceptor.to_io.local_address.ip_port)
+            connection = ::Timeout.timeout(2) { accepted.future.value }
+            unblocker = reactor.instance_variable_get(:@unblocker)
+            allow(unblocker).to receive(:unblock).and_call_original
+            sleep(0.1)
+            calls = selector.calls
+
+            connection.public_send(operation)
+
+            expect(unblocker).to have_received(:unblock)
+            await { selector.calls > calls }
+            expect(::Timeout.timeout(2) { peer.read }).to eq('')
+          ensure
+            peer.close if peer && !peer.closed?
+          end
+        end
       end
 
       describe('TLS handshake') do
@@ -279,7 +346,7 @@ module Cassandra
             future   = reactor.connect('127.0.0.1', port, timeout: 0.5, ssl: true)
             accepted = server.accept
 
-            expect { future.value }.to raise_error(Ione::Io::ConnectionTimeoutError, /TLS handshake/)
+            expect { ::Timeout.timeout(3) { future.value } }.to raise_error(Ione::Io::ConnectionTimeoutError, /TLS handshake/)
             expect(::Time.now - started).to be < 1
 
             # the half-open socket is closed, not left in the loop: reading
@@ -294,7 +361,7 @@ module Cassandra
             future = reactor.connect('127.0.0.1', port, timeout: 1, ssl: true)
             accepted = server.accept
             begin
-              future.value
+              ::Timeout.timeout(3) { future.value }
             rescue Ione::Io::ConnectionTimeoutError
               nil
             end
@@ -374,7 +441,47 @@ module Cassandra
         end
       end
 
+      describe('accept errors') do
+        [::IOError, ::Errno::EBADF, ::Errno::ECONNABORTED].each do |error_class|
+          it "handles #{error_class} at the listener without stopping the reactor" do
+            reactor.start.value
+            acceptor = reactor.bind('127.0.0.1', 0, 5).value
+            allow(acceptor.to_io).to receive(:accept_nonblock).and_raise(error_class)
+
+            expect { acceptor.read }.not_to raise_error
+
+            expect(acceptor.closed?).to eq(error_class != ::Errno::ECONNABORTED)
+            ::Timeout.timeout(2) { reactor.schedule_timer(0.01).value }
+            expect(reactor).to be_running
+          end
+        end
+      end
+
       describe('plain TCP') do
+        context('when TCP completes while the reactor is stopped') do
+          let(:clock) { double('clock', now: 100.0) }
+          let(:reactor) { IoReactor.new(selector: selector, clock: clock) }
+
+          it 'uses the completed connection even when the deadline has elapsed before restart' do
+            server = ::TCPServer.new('127.0.0.1', 0)
+            reactor.start.value
+            reactor.stop.value
+            connected = reactor.connect('127.0.0.1', server.addr[1], timeout: 0.25)
+            peer = server.accept
+            allow(clock).to receive(:now).and_return(100.25)
+
+            ::Timeout.timeout(3) do
+              reactor.start.value
+              connected.value.write('hello')
+              expect(peer.read(5)).to eq('hello')
+              reactor.stop.value
+            end
+          ensure
+            peer.close if peer
+            server.close if server
+          end
+        end
+
         it 'fails fast when nothing is listening' do
           reactor.start.value
 
@@ -505,6 +612,47 @@ module Cassandra
         connection
       end
 
+      [:connect, :read, :flush].each do |operation|
+        [::IOError, ::Errno::EBADF].each do |error_class|
+          it "isolates #{error_class} during #{operation} and continues reading healthy connections" do
+            reader, writer = ::IO.pipe
+            bad = add_connection(reader.dup)
+            healthy = add_connection(reader)
+            if operation == :connect
+              bad.instance_variable_set(:@state, Ione::Io::BaseConnection::CONNECTING_STATE)
+            elsif operation == :flush
+              allow(bad).to receive(:writable?).and_return(true)
+            end
+            allow(bad).to receive(operation).and_raise(error_class, 'closed stream')
+            selected_readers = operation == :read ? [bad, healthy] : [healthy]
+            selected_writers = operation == :flush ? [bad] : nil
+            allow(selector).to receive(:select).and_return([selected_readers, selected_writers, nil])
+            received = nil
+            healthy.on_data {|data| received = data}
+            writer.write('hello')
+
+            expect { io_loop.tick }.not_to raise_error
+
+            expect(bad).to be_closed
+            expect(healthy).not_to be_closed
+            expect(received).to eq('hello')
+          ensure
+            writer.close if writer
+          end
+        end
+      end
+
+      it 'propagates dispatch errors unrelated to closed sockets' do
+        reader, writer = ::IO.pipe
+        connection = add_connection(reader)
+        allow(connection).to receive(:read).and_raise(ArgumentError, 'invalid handler')
+        allow(selector).to receive(:select).and_return([[connection], nil, nil])
+
+        expect { io_loop.tick }.to raise_error(ArgumentError, 'invalid handler')
+      ensure
+        writer.close if writer
+      end
+
       [::IOError, ::Errno::EBADF, ::TypeError].each do |error_class|
         it "evicts an invalid socket after #{error_class} and retains healthy sockets" do
           reader, writer = ::IO.pipe
@@ -552,19 +700,81 @@ module Cassandra
     end
 
     describe(IoReactor::Connection) do
+      let(:clock) { double('clock', now: 100.0) }
+      let(:socket) { double('socket', close: nil) }
+      let(:socket_impl) do
+        impl = double('socket_impl')
+        allow(impl).to receive(:getaddrinfo).and_return([[nil, 9042, nil, '127.0.0.1', ::Socket::AF_INET, ::Socket::SOCK_STREAM]])
+        allow(impl).to receive(:sockaddr_in).and_return('SOCKADDR')
+        allow(impl).to receive(:new).and_return(socket)
+        impl
+      end
+      let(:connection) do
+        IoReactor::Connection.new('127.0.0.1', 9042, 0.25, double('unblocker', unblock: nil), clock, socket_impl)
+      end
+
       it 'fails at the connect deadline without waiting for another polling tick' do
-        clock = double('clock', now: 100.0)
-        connection = IoReactor::Connection.new('127.0.0.1', 9042, 0.25, nil, clock)
+        allow(socket).to receive(:connect_nonblock).and_raise(Errno::EINPROGRESS)
+        future = connection.connect
         allow(clock).to receive(:now).and_return(100.25)
 
-        expect { connection.connect.value }.to raise_error(Ione::Io::ConnectionTimeoutError)
+        connection.connect
+        expect { future.value }.to raise_error(Ione::Io::ConnectionTimeoutError)
+        expect(connection).to be_closed
+      end
+
+      [nil, Errno::EISCONN].each do |result|
+        it "prefers a completed connect (#{result || 'success'}) over the deadline" do
+          allow(socket).to receive(:connect_nonblock).and_raise(Errno::EINPROGRESS)
+          future = connection.connect
+          if result
+            allow(socket).to receive(:connect_nonblock).and_raise(result)
+          else
+            allow(socket).to receive(:connect_nonblock).and_return(0)
+          end
+          allow(clock).to receive(:now).and_return(100.25)
+
+          connection.connect
+
+          expect(future.value).to eq(connection)
+          expect(connection).to be_connected
+        end
+      end
+
+      it 'fails only its own connection when the first connect attempt raises IOError' do
+        allow(socket).to receive(:connect_nonblock).and_raise(IOError, 'closed stream')
+        future = nil
+
+        expect { future = connection.connect }.not_to raise_error
+
+        expect { future.value }.to raise_error(Ione::Io::ConnectionError, 'closed stream')
         expect(connection).to be_closed
       end
     end
 
     describe(IoReactor::SslConnection) do
+      it 'accepts a handshake that completes at the deadline and preserves the completed future' do
+        clock = double('clock', now: 100.0)
+        raw_socket = double('raw socket', closed?: false, close: nil)
+        ssl_socket = double('SSL socket', close: nil)
+        socket_impl = double('SSL socket implementation', new: ssl_socket)
+        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, raw_socket, double('unblocker', unblock: nil), nil, 100.25, clock)
+        connection.instance_variable_set(:@socket_impl, socket_impl)
+        allow(ssl_socket).to receive(:connect_nonblock).and_raise(::IO::EAGAINWaitReadable)
+        future = connection.connect
+        allow(clock).to receive(:now).and_return(100.25)
+        allow(ssl_socket).to receive(:connect_nonblock).and_return(ssl_socket)
+
+        connection.connect
+
+        expect(future.value).to eq(connection)
+        expect(connection).to be_connected
+        expect(connection.connect).to equal(future)
+        expect(connection).not_to be_closed
+      end
+
       it 'fails the handshake without raising when the raw socket has disappeared' do
-        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, nil, nil, nil,
+        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, nil, double('unblocker', unblock: nil), nil,
                                                   ::Time.now + 1, ::Time)
         future = connection.connect
 
@@ -576,7 +786,7 @@ module Cassandra
 
       it 'closes the raw socket when closed before the handshake starts' do
         reader, writer = ::IO.pipe
-        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, reader, nil, nil,
+        connection = IoReactor::SslConnection.new('127.0.0.1', 9042, reader, double('unblocker', unblock: nil), nil,
                                                   ::Time.now + 1, ::Time)
         expect(connection.close).to eq(true)
         expect(reader).to be_closed

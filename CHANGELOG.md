@@ -10,6 +10,9 @@ Bug Fixes:
 * `Reconnection::Policies::Exponential` accepts a `jitter:` fraction (e.g. `Exponential.new(1, 60, 2, jitter: 0.25)`) so a fleet of processes does not reconnect in lockstep; the ceiling is always honoured.
 * Reactor restarts restore the wake-up pipe atomically with the start transition, including when shutdown completes during a restart request; shutdown drains use a fixed tick even when timers are overdue.
 * Connection attempts sleep until their nearest deadline, and timers scheduled on the reactor thread avoid redundant wake-ups.
+* Closing or draining connections and listeners wakes the reactor so idle sockets and listening ports are released promptly.
+* Socket `IOError` and `EBADF` failures during connect, read, or flush close only the affected socket; transient accept errors leave the listener available for retry.
+* Completed TCP connections and TLS handshakes take precedence over expired deadlines, including connections queued while the reactor is stopped.
 * `connect_timeout: Float::INFINITY` continues to allow unbounded TCP connects and TLS handshakes.
 * Reconnection jitter samples within the bounded window, avoiding a concentration of retries at the maximum interval.
 * Requires ione 1.3.x (`~> 1.3.0`).

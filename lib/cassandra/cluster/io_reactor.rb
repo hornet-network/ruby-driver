@@ -168,7 +168,59 @@ module Cassandra
       end
 
       # @private
+      module ConnectionLifecycle
+        # Release the descriptor and wake select before notifying listeners,
+        # matching the close ordering in ione's reactor fix.
+        def close(cause = nil)
+          @lock.synchronize do
+            return false if @state == Ione::Io::BaseConnection::CLOSED_STATE
+            @state = Ione::Io::BaseConnection::CLOSED_STATE
+            @writable = false
+          end
+          if @io
+            begin
+              @io.close
+              @io = nil
+            rescue ::SystemCallError, ::IOError
+              # The descriptor may already have been closed by another thread.
+            end
+          end
+          @unblocker.unblock
+          if cause && !cause.is_a?(Ione::IoError)
+            cause = Ione::Io::ConnectionClosedError.new(cause.message)
+          end
+          cause ? @closed_promise.fail(cause) : @closed_promise.fulfill(self)
+          true
+        end
+      end
+
+      # @private
+      module AcceptorLifecycle
+        def close
+          closed = super
+          @unblocker.unblock if closed
+          closed
+        end
+
+        # The inherited drain alias bypasses an overridden close method.
+        def drain
+          close
+        end
+
+        def read
+          super
+        rescue ::IOError, ::Errno::EBADF
+          close
+        rescue ::SystemCallError
+          # A transient accept error leaves the listener available for retry.
+          nil
+        end
+      end
+
+      # @private
       class Connection < Ione::Io::Connection
+        include ConnectionLifecycle
+
         attr_reader :deadline
 
         def initialize(*args)
@@ -180,13 +232,18 @@ module Cassandra
         def connect
           return @connected_promise.future if closed?
 
-          if @deadline && !connected? && @clock.now >= @deadline
+          # Let a completed kernel handshake win over the deadline. The parent
+          # leaves the connection pending only after EINPROGRESS or EALREADY.
+          future = super
+          if @deadline && connecting? && @clock.now >= @deadline
             close(Ione::Io::ConnectionTimeoutError.new(
                     "Could not connect to #{@host}:#{@port} within #{@connection_timeout}s"
             ))
-            return @connected_promise.future
           end
-          super
+          future
+        rescue ::IOError => e
+          close(e)
+          @connected_promise.future
         end
       end
 
@@ -218,6 +275,17 @@ module Cassandra
           @clock           = options[:clock] || ::Time
           @tick_resolution = options[:tick_resolution] || 1
           @drain_timeout   = options[:drain_timeout] || 5
+        end
+
+        def add_socket(socket)
+          # bind/accept create ione's server sockets. Apply the same lifecycle
+          # fixes to those instances without modifying the dependency globally.
+          if socket.is_a?(Ione::Io::ServerConnection)
+            socket.extend(ConnectionLifecycle)
+          elsif socket.is_a?(Ione::Io::Acceptor)
+            socket.extend(AcceptorLifecycle)
+          end
+          super
         end
 
         # @param timeout [Numeric, nil] fixed select timeout while draining;
@@ -264,9 +332,9 @@ module Cassandra
             raise unless evict_dead_sockets(readables + writables, e)
             return
           end
-          connecting.each(&:connect)
-          r && r.each {|s| s.read if s.connected?}
-          w && w.each(&:flush)
+          connecting.each {|s| dispatch(s, :connect)}
+          r && r.each {|s| dispatch(s, :read) if s.connected?}
+          w && w.each {|s| dispatch(s, :flush)}
         end
 
         def drain_sockets
@@ -289,6 +357,19 @@ module Cassandra
           @thread.name = THREAD_NAME if @thread.name.nil?
         end
 
+        def dispatch(socket, method)
+          socket.__send__(method)
+        rescue ::IOError, ::Errno::EBADF => e
+          close_socket(socket, e)
+        end
+
+        def close_socket(socket, error)
+          socket.is_a?(Ione::Io::BaseConnection) ? socket.close(error) : socket.close
+        rescue
+          # The descriptor may already be closed.
+          nil
+        end
+
         # select raised because a file descriptor in the set is closed. Close
         # and drop the offending sockets so the loop cannot spin on them.
         def evict_dead_sockets(sockets, error)
@@ -305,13 +386,7 @@ module Cassandra
               true
             end
           end
-          dead.each do |s|
-            begin
-              s.is_a?(Ione::Io::BaseConnection) ? s.close(error) : s.close
-            rescue
-              nil
-            end
-          end
+          dead.each {|s| close_socket(s, error)}
           @lock.synchronize { @sockets = @sockets.reject {|s| s.closed? || dead.include?(s)} }
           !dead.empty?
         end
@@ -319,6 +394,8 @@ module Cassandra
 
       # @private
       class SslConnection < Ione::Io::SslConnection
+        include ConnectionLifecycle
+
         attr_reader :deadline
 
         def initialize(host, port, io, unblocker, ssl_context, deadline, clock)
@@ -335,10 +412,9 @@ module Cassandra
         end
 
         def connect
-          return @connected_promise.future if closed?
-          fail_if_past_deadline
-          return @connected_promise.future if closed?
+          return @connected_promise.future if closed? || connected?
 
+          # Check the deadline only if the handshake still needs IO.
           if @io.nil?
             @io = if @ssl_context
                     @socket_impl.new(@raw_io, @ssl_context)
