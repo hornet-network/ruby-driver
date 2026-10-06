@@ -20,18 +20,23 @@ module Cassandra
   module Reconnection
     module Policies
       # A reconnection policy that returns a constant exponentially growing
-      # reconnection interval up to a given maximum
+      # reconnection interval up to a given maximum, optionally randomised by
+      # a jitter fraction so that many clients do not reconnect in lockstep.
       class Exponential < Policy
         # @private
         class Schedule
-          def initialize(start, max, exponent)
+          def initialize(start, max, exponent, jitter, random)
             @interval = start
             @max      = max
             @exponent = exponent
+            @jitter   = jitter
+            @random   = random
           end
 
           def next
-            @interval.tap { backoff if @interval < @max }
+            interval = @interval
+            backoff if @interval < @max
+            randomize(interval)
           end
 
           private
@@ -45,11 +50,27 @@ module Cassandra
                           new_interval
                         end
           end
+
+          # Spreads the interval by up to +/- jitter, never above the maximum.
+          def randomize(interval)
+            return interval if @jitter.zero?
+
+            lower = interval * (1 - @jitter)
+            upper = [interval * (1 + @jitter), @max].min
+            lower + (upper - lower) * @random.rand
+          end
         end
 
         # @param start    [Numeric] beginning interval
-        # @param max      [Numeric] maximum reconnection interval
+        # @param max      [Numeric] maximum reconnection interval; never
+        #   exceeded, even with jitter
         # @param exponent [Numeric] (2) interval exponent to use
+        # @param jitter   [Numeric] (0) fraction in `0...1` by which each
+        #   interval is randomised, e.g. `0.25` for +/- 25%
+        # @param random   [#rand] (Random) source of randomness for
+        #   jitter
+        #
+        # @raise [ArgumentError] if jitter is not in `0...1`
         #
         # @example Using this policy
         #   policy   = Cassandra::Reconnection::Policies::Exponential.new(0.5, 10, 2)
@@ -62,16 +83,35 @@ module Cassandra
         #   schedule.next # 10.0
         #   schedule.next # 10.0
         #   schedule.next # 10.0
-        def initialize(start, max, exponent = 2)
+        #
+        # @example With jitter, so that a fleet does not reconnect in lockstep
+        #   policy   = Cassandra::Reconnection::Policies::Exponential.new(1, 60, 2, jitter: 0.25)
+        #   schedule = policy.schedule
+        #   schedule.next # somewhere in 0.75..1.25
+        #   schedule.next # somewhere in 1.5..2.5
+        #   # ...
+        #   schedule.next # somewhere in 45..60
+        def initialize(start, max, exponent = 2, jitter: 0, random: ::Random)
+          begin
+            jitter = Float(jitter)
+          rescue ::TypeError, ::ArgumentError
+            raise ::ArgumentError, "jitter must be in 0...1, #{jitter.inspect} given"
+          end
+          unless jitter >= 0 && jitter < 1
+            raise ::ArgumentError, "jitter must be in 0...1, #{jitter.inspect} given"
+          end
+
           @start    = start
           @max      = max
           @exponent = exponent
+          @jitter   = jitter
+          @random   = random
         end
 
         # @return [Cassandra::Reconnection::Schedule] an exponential
         #   reconnection schedule
         def schedule
-          Schedule.new(@start, @max, @exponent)
+          Schedule.new(@start, @max, @exponent, @jitter, @random)
         end
       end
     end

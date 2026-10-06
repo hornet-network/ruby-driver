@@ -1,15 +1,15 @@
 GIT
   remote: https://github.com/hornet-network/ione.git
-  revision: e665ea33e98003ca029cdeafb37116dc0a5dae85
-  branch: main
+  revision: 6e94243e4e30875c50e415bc8d86c7dc91988cd4
+  branch: master
   specs:
     ione (1.3.1)
 
 PATH
   remote: .
   specs:
-    cassandra-driver (3.2.5)
-      ione
+    cassandra-driver (3.2.6)
+      ione (~> 1.3.0)
       sorted_set
 
 GEM

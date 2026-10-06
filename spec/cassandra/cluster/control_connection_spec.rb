@@ -1059,6 +1059,62 @@ module Cassandra
       end
 
       describe "#close_async" do
+        it 'stops the reactor even before the first connect' do
+          expect(io_reactor).to receive(:stop).once.and_return(Ione::Future.resolved)
+          expect(control_connection.close_async).to be_resolved
+          expect(control_connection.close_async).to be_resolved
+        end
+
+        it 'does not connect on a host-up notification before the first connect' do
+          expect(io_reactor).not_to receive(:connect)
+          control_connection.host_up(cluster_registry.hosts.first).value
+        end
+
+        it 'can close again after an explicit reconnect' do
+          control_connection.connect_async.value
+          first_close = control_connection.close_async
+          expect(first_close).to be_resolved
+
+          control_connection.connect_async.value
+          stopped = Ione::Promise.new
+          expect(io_reactor).to receive(:stop).once.and_return(stopped.future)
+          second_close = control_connection.close_async
+          expect(second_close).not_to equal(first_close)
+          expect(second_close).not_to be_completed
+          stopped.fulfill
+          expect(second_close).to be_resolved
+        end
+
+        it 'keeps the original close future when a listener reconnects' do
+          control_connection.connect_async.value
+          first_close = nil
+          control_connection.on_close do
+            first_close = control_connection.close_async
+            control_connection.connect_async.value
+          end
+          returned = control_connection.close_async
+
+          expect(returned).to equal(first_close)
+          expect(first_close).to be_resolved
+          expect(io_reactor).to be_running
+        end
+
+        it 'stops only once when a socket closes before the stop future resolves' do
+          control_connection.connect_async.value
+          stopped = Ione::Promise.new
+          expect(io_reactor).to receive(:stop).once do
+            last_connection.close
+            stopped.future
+          end
+
+          closing = control_connection.close_async
+          expect(control_connection.close_async).to equal(closing)
+          expect(closing).not_to be_completed
+          expect { control_connection.connect_async.value }.to raise_error(Errors::ClientError, /closing/)
+          stopped.fulfill
+          expect(closing).to be_resolved
+        end
+
         context 'when connected' do
           before do
             control_connection.connect_async.value
