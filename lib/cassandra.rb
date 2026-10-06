@@ -826,6 +826,10 @@ require 'cassandra/util'
 # murmur3 hash extension
 require 'cassandra_murmur3'
 
+# Ruby 3.0 removed SortedSet from the set stdlib; it now lives in the
+# sorted_set gem, which this gem declares as a runtime dependency.
+require 'sorted_set'
+
 # SortedSet has a race condition where it does some class/global initialization when the first instance is created.
 # If this is done in a multi-threaded environment, bad things can happen. So force the initialization here,
 # when loading the C* module.

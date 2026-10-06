@@ -135,13 +135,13 @@ module Cassandra
       end
 
       def reactor_threads
-        ::Thread.list.select {|t| t.name == Cluster::IoReactor::THREAD_NAME}
+        ::Thread.list.select {|t| t.name == Ione::Io::IoReactor::THREAD_NAME}
       end
 
       describe('#close') do
         it 'stops the reactor thread and the executor threads' do
           before  = ::Thread.list.size
-          driver  = Driver.new(io_reactor: Cluster::IoReactor.new)
+          driver  = Driver.new(io_reactor: Ione::Io::IoReactor.new)
           cluster = driver.cluster
 
           driver.io_reactor.start.value
@@ -155,7 +155,7 @@ module Cassandra
         end
 
         it 'can be called more than once' do
-          driver  = Driver.new(io_reactor: Cluster::IoReactor.new)
+          driver  = Driver.new(io_reactor: Ione::Io::IoReactor.new)
           cluster = driver.cluster
           driver.io_reactor.start.value
 
