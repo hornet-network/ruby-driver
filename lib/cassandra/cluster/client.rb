@@ -167,7 +167,11 @@ module Cassandra
         @state == :closed || @state == :closing
       end
 
-      # These methods shall be called from inside reactor thread only
+      # Registry callbacks. They are invoked from whichever thread notifies the
+      # registry: the reactor thread for topology events, the application
+      # thread for the initial contact points, and the contact-point lookup
+      # thread when hostnames are re-resolved. All state changes below are
+      # therefore guarded by the client's own lock.
       def host_found(host)
         nil
       end
