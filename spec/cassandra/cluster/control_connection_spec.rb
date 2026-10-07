@@ -1070,33 +1070,72 @@ module Cassandra
           control_connection.host_up(cluster_registry.hosts.first).value
         end
 
-        it 'can close again after an explicit reconnect' do
+        it 'rejects a connect after close' do
           control_connection.connect_async.value
-          first_close = control_connection.close_async
-          expect(first_close).to be_resolved
+          expect(control_connection.close_async).to be_resolved
 
-          control_connection.connect_async.value
-          stopped = Ione::Promise.new
-          expect(io_reactor).to receive(:stop).once.and_return(stopped.future)
-          second_close = control_connection.close_async
-          expect(second_close).not_to equal(first_close)
-          expect(second_close).not_to be_completed
-          stopped.fulfill
-          expect(second_close).to be_resolved
+          expect(io_reactor).not_to receive(:start)
+          expect { control_connection.connect_async.value }.to raise_error(Errors::ClientError, /closed/)
+          expect(control_connection.close_async).to be_resolved
         end
 
-        it 'keeps the original close future when a listener reconnects' do
+        it 'keeps close listeners when a listener tries to reconnect' do
           control_connection.connect_async.value
-          first_close = nil
+          calls = 0
           control_connection.on_close do
-            first_close = control_connection.close_async
-            control_connection.connect_async.value
+            calls += 1
+            control_connection.connect_async
           end
-          returned = control_connection.close_async
+          expect(control_connection.close_async).to be_resolved
+          expect(control_connection.close_async).to be_resolved
+          expect(calls).to eq(1)
+        end
 
-          expect(returned).to equal(first_close)
-          expect(first_close).to be_resolved
-          expect(io_reactor).to be_running
+        it 'logs the cause when the reactor stops with an error' do
+          control_connection.connect_async.value
+          expect(io_reactor).to receive(:stop).once.and_return(Ione::Future.failed(Ione::Io::ReactorError.new('drain timeout')))
+          expect(logger).to receive(:warn).with(/drain timeout/)
+
+          expect(control_connection.close_async).to be_resolved
+        end
+
+        context 'with a connect attempt in flight' do
+          let(:pending) { Ione::Promise.new }
+
+          before do
+            expect(driver.connector).to receive(:connect).once.and_return(pending.future)
+          end
+
+          it 'does not adopt a connection that completes after closing started' do
+            connecting = control_connection.connect_async
+            expect(io_reactor).to receive(:stop).once.and_return(Ione::Future.resolved)
+            expect(control_connection.close_async).to be_resolved
+
+            connection = double('connection')
+            expect(connection).to receive(:close)
+            pending.fulfill(connection)
+
+            expect { connecting.value }.to raise_error(Errors::ClientError, /closing/)
+            expect { control_connection.connect_async.value }.to raise_error(Errors::ClientError, /closed/)
+          end
+
+          it 'does not try the next host after closing started' do
+            connecting = control_connection.connect_async
+            expect(io_reactor).to receive(:stop).once.and_return(Ione::Future.resolved)
+            expect(control_connection.close_async).to be_resolved
+
+            pending.fail(Errors::IOError.new('socket closed by reactor stop'))
+
+            expect { connecting.value }.to raise_error(Errors::ClientError, /closing/)
+          end
+
+          it 'shares the attempt with a host-up notification instead of starting another' do
+            connecting = control_connection.connect_async
+            shared = control_connection.host_up(cluster_registry.hosts.first)
+
+            expect(connecting).not_to be_completed
+            expect(shared).not_to be_completed
+          end
         end
 
         it 'stops only once when a socket closes before the stop future resolves' do

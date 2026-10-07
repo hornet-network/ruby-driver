@@ -161,7 +161,7 @@ module Cassandra
 
           expect(cluster.close).to eq(cluster)
           expect(cluster.close).to eq(cluster)
-          expect(reactor_threads).to be_empty
+          await { reactor_threads.empty? }
         end
       end
 

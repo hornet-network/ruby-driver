@@ -39,6 +39,7 @@ module Cassandra
         @connection            = nil
         @schema_fetcher        = schema_fetcher
         @refreshing_statuses   = ::Hash.new(false)
+        @connect_attempt       = nil
         @refresh_schema_future = nil
         @status                = :disconnected
         @refreshing_hosts      = false
@@ -62,15 +63,16 @@ module Cassandra
           if @status == :closing
             return Ione::Future.failed(Errors::ClientError.new('Control connection is closing'))
           end
-          @closed_promise = Ione::Promise.new if @status == :closed
+          if @status == :closed
+            # A closed control connection stays closed: its close listeners
+            # have fired, the cluster's executor is shut down and per-host
+            # timer state is stale. Build a new cluster instead.
+            return Ione::Future.failed(Errors::ClientError.new('Control connection is closed'))
+          end
           @status = :connecting
         end
 
-        f = @io_reactor.start.flat_map do
-          plan = @load_balancing_policy.plan(nil, VOID_STATEMENT, VOID_OPTIONS)
-          connect_to_first_available(plan)
-        end
-        f
+        @io_reactor.start.flat_map { start_connect_attempt }
       end
 
       def host_found(host)
@@ -93,9 +95,7 @@ module Cassandra
           unless @connection ||
                  (@status == :disconnected || @status == :closing || @status == :closed) ||
                  @load_balancing_policy.distance(host) == :ignore
-            return connect_to_first_available(
-              @load_balancing_policy.plan(nil, VOID_STATEMENT, VOID_OPTIONS)
-            )
+            return start_connect_attempt
           end
         end
 
@@ -140,13 +140,18 @@ module Cassandra
         end
         f = @io_reactor.stop
 
-        f.on_value(&method(:connection_closed))
-        f.on_failure(&method(:connection_closed))
+        f.on_value { connection_closed(nil) }
+        f.on_failure {|e| connection_closed(e)}
 
         promise.future
       end
 
       def connection_closed(cause)
+        if cause
+          @logger.warn('Control connection reactor stopped with an error ' \
+            "(#{cause.class.name}: #{cause.message})")
+        end
+
         promise = synchronize do
           @status = :closed
           @closed_promise
@@ -188,8 +193,7 @@ module Cassandra
         f = @io_reactor.schedule_timer(timeout)
         f = f.flat_map do
           if synchronize { @status == :reconnecting }
-            plan = @load_balancing_policy.plan(nil, VOID_STATEMENT, VOID_OPTIONS)
-            connect_to_first_available(plan)
+            start_connect_attempt
           else
             Ione::Future.resolved
           end
@@ -613,7 +617,32 @@ module Cassandra
         @logger.error("Refreshing host metadata failed (#{e.class.name}: #{e.message})")
       end
 
+      # Only one connect attempt runs at a time. A host-up notification or a
+      # reconnect timer that fires while an attempt is in flight shares its
+      # outcome instead of starting a competing attempt, which would leave an
+      # orphaned control connection with live event handlers.
+      def start_connect_attempt
+        synchronize do
+          return @connect_attempt if @connect_attempt
+
+          plan = @load_balancing_policy.plan(nil, VOID_STATEMENT, VOID_OPTIONS)
+          f = connect_to_first_available(plan)
+          @connect_attempt = f
+          f.on_complete do |_|
+            synchronize { @connect_attempt = nil if @connect_attempt.equal?(f) }
+          end
+          f
+        end
+      end
+
       def connect_to_first_available(plan, errors = nil)
+        # Once closing has started, do not open any more sockets: the reactor
+        # is stopping and a socket opened on a stopped reactor is never ticked
+        # and never times out.
+        if synchronize { @status == :closing || @status == :closed }
+          return Ione::Future.failed(Errors::ClientError.new('Control connection is closing'))
+        end
+
         unless plan.has_next?
           if errors.nil? && synchronize { @refreshing_statuses.empty? }
             @logger.fatal(<<-MSG)
@@ -634,7 +663,12 @@ Control connection failed and is unlikely to recover.
 
         f = connect_to_host(host)
         f = f.flat_map do |connection|
-          synchronize do
+          adopted = synchronize do
+            # Closing may have started while this connect was in flight; do
+            # not adopt the connection, or its close would trigger a reconnect
+            # on a reactor that is shutting down.
+            next false if @status == :closing || @status == :closed
+
             @status = :connected
 
             @connection = connection
@@ -662,6 +696,13 @@ Control connection failed and is unlikely to recover.
 
               reconnect_async(@reconnection_policy.schedule) if reconnect
             end
+
+            true
+          end
+
+          unless adopted
+            connection.close
+            next Ione::Future.failed(Errors::ClientError.new('Control connection is closing'))
           end
 
           refresh_maybe_retry(:metadata)

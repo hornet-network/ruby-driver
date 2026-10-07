@@ -70,7 +70,7 @@ module Cassandra
         # @param random   [#rand] (Random) source of randomness for
         #   jitter
         #
-        # @raise [ArgumentError] if jitter is not in `0...1`
+        # @raise [ArgumentError] if jitter is not in `0...1` or start exceeds max
         #
         # @example Using this policy
         #   policy   = Cassandra::Reconnection::Policies::Exponential.new(0.5, 10, 2)
@@ -92,13 +92,14 @@ module Cassandra
         #   # ...
         #   schedule.next # somewhere in 45..60
         def initialize(start, max, exponent = 2, jitter: 0, random: ::Random)
-          begin
-            jitter = Float(jitter)
-          rescue ::TypeError, ::ArgumentError
+          value = (Float(jitter) rescue nil)
+          unless value && value >= 0 && value < 1
             raise ::ArgumentError, "jitter must be in 0...1, #{jitter.inspect} given"
           end
-          unless jitter >= 0 && jitter < 1
-            raise ::ArgumentError, "jitter must be in 0...1, #{jitter.inspect} given"
+          jitter = value
+
+          unless start <= max
+            raise ::ArgumentError, "start must not exceed max, #{start.inspect} > #{max.inspect} given"
           end
 
           @start    = start

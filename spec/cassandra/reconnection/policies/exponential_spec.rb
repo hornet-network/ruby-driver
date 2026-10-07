@@ -74,6 +74,11 @@ module Cassandra
               expect(schedule.next).to eq(48.75)
             end
 
+            it 'rejects a start above the max' do
+              expect { Exponential.new(50, 10, 2, jitter: 0.25) }.to raise_error(::ArgumentError, /start/)
+              expect { Exponential.new(50, 10, 2) }.to raise_error(::ArgumentError, /start/)
+            end
+
             it 'rejects a jitter outside 0...1' do
               expect { Exponential.new(1, 60, 2, jitter: 1) }.to raise_error(::ArgumentError)
               expect { Exponential.new(1, 60, 2, jitter: -0.1) }.to raise_error(::ArgumentError)
