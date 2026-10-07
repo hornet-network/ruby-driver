@@ -213,6 +213,17 @@ module Cassandra
           expect(cluster_registry.listeners).to be_empty
         end
 
+        it 'fails statements promptly once closed' do
+          client.connect.value
+          client.close.value
+          expect(client).to be_closed
+
+          statement = Statements::Simple.new('SELECT now() FROM system.local')
+          options   = driver.execution_options
+          expect { client.query(statement, options).get }.to raise_error(Errors::ClientError, 'Client closed')
+          expect { client.prepare('SELECT now() FROM system.local', options).get }.to raise_error(Errors::ClientError, 'Client closed')
+        end
+
         context 'with error' do
           it 'logs error' do
             logger.stub(:error)

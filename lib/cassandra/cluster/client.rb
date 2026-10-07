@@ -162,6 +162,11 @@ module Cassandra
         @closed_future
       end
 
+      # @return [Boolean] true once {#close} has been called
+      def closed?
+        @state == :closed || @state == :closing
+      end
+
       # These methods shall be called from inside reactor thread only
       def host_found(host)
         nil
@@ -228,6 +233,8 @@ module Cassandra
       end
 
       def query(statement, options)
+        return closed_error if closed?
+
         if !statement.params.empty? && @connection_options.protocol_version == 1
           return @futures.error(
             Errors::ClientError.new(
@@ -269,6 +276,8 @@ module Cassandra
       end
 
       def prepare(cql, options)
+        return closed_error if closed?
+
         payload = nil
         payload = options.payload if @connection_options.protocol_version >= 4
         request = Protocol::PrepareRequest.new(cql, options.trace?, payload)
@@ -291,6 +300,8 @@ module Cassandra
       end
 
       def execute(statement, options)
+        return closed_error if closed?
+
         timestamp = @timestamp_generator.next if @timestamp_generator && @connection_options.protocol_version > 2
         payload         = nil
         payload         = options.payload if @connection_options.protocol_version >= 4
@@ -318,6 +329,8 @@ module Cassandra
       end
 
       def batch(statement, options)
+        return closed_error if closed?
+
         if @connection_options.protocol_version < 2
           return @futures.error(
             Errors::ClientError.new(
@@ -359,6 +372,10 @@ module Cassandra
         counter: Protocol::BatchRequest::COUNTER_TYPE
       }.freeze
       CLIENT_CLOSED        = Ione::Future.failed(Errors::ClientError.new('Client closed'))
+
+      def closed_error
+        @futures.error(Errors::ClientError.new('Client closed'))
+      end
       NOT_CONNECTED        = Errors::ClientError.new('Client not connected')
       CLIENT_NOT_CONNECTED = Ione::Future.failed(NOT_CONNECTED)
 

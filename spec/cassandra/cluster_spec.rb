@@ -17,6 +17,7 @@
 #++
 
 require 'spec_helper'
+require 'timeout'
 
 module Cassandra
   describe(Cluster) do
@@ -110,6 +111,30 @@ module Cassandra
         stopped.fulfill
         expect(promise).to have_received(:fulfill).once.with(cluster)
         expect(executor).to have_received(:shutdown).once
+      end
+    end
+
+    describe('#close with sessions') do
+      it 'closes every session so later statements fail promptly with Client closed' do
+        session = cluster.connect
+        expect(session.execute('SELECT now() FROM system.local')).to be_a(Result)
+
+        cluster.close
+
+        expect(cluster_registry).to have(0).listeners
+        expect do
+          ::Timeout.timeout(2) { session.execute('SELECT now() FROM system.local') }
+        end.to raise_error(Errors::ClientError, 'Client closed')
+        expect do
+          ::Timeout.timeout(2) { session.prepare('SELECT now() FROM system.local') }
+        end.to raise_error(Errors::ClientError, 'Client closed')
+      end
+
+      it 'closes a session that is still connecting' do
+        future = cluster.connect_async
+        cluster.close
+        expect(cluster_registry).to have(0).listeners
+        future.get if future.respond_to?(:get)
       end
     end
 

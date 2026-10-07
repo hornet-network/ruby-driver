@@ -48,12 +48,21 @@ module Cassandra
       end
 
       def execute(*args, &block)
-        synchronize do
-          return if @term
+        task = Task.new(*args, &block)
 
-          @tasks << Task.new(*args, &block)
-          @cond.signal if @waiting > 0
+        synchronize do
+          unless @term
+            @tasks << task
+            @cond.signal if @waiting > 0
+            return nil
+          end
         end
+
+        # Once shut down, run the task on the calling thread instead of
+        # dropping it. Future listeners and the wake-up of threads blocked in
+        # Future#get are dispatched through here; dropping them would leave a
+        # thread that still holds a session of a closed cluster waiting forever.
+        task.run
 
         nil
       end

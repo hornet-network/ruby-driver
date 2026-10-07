@@ -57,6 +57,8 @@ module Cassandra
       @connector             = connector
       @futures               = futures_factory
       @timestamp_generator   = timestamp_generator
+      @clients               = ::Array.new
+      @clients_lock          = ::Mutex.new
 
       @control_connection.on_close do |_cause|
         begin
@@ -242,6 +244,11 @@ module Cassandra
       session = Session.new(client, @execution_options, @futures, @profile_manager)
       promise = @futures.promise
 
+      @clients_lock.synchronize do
+        @clients.reject!(&:closed?)
+        @clients << client
+      end
+
       client.connect.on_complete do |f|
         if f.resolved?
           if keyspace
@@ -290,7 +297,10 @@ module Cassandra
     def close_async
       promise = @futures.promise
 
-      @control_connection.close_async.on_complete do |f|
+      # Close every session's client first so that a thread still holding a
+      # session fails fast with "Client closed", and its in-flight requests
+      # fail now, rather than waiting on a reactor that is about to stop.
+      close_clients_async.flat_map { @control_connection.close_async }.on_complete do |f|
         if f.resolved?
           promise.fulfill(self)
         else
@@ -310,6 +320,21 @@ module Cassandra
     # @see Cassandra::Cluster#close_async
     def close
       close_async.get
+    end
+
+    # @private
+    def close_clients_async
+      clients = @clients_lock.synchronize do
+        closing = @clients.dup
+        @clients.clear
+        closing
+      end
+
+      return Ione::Future.resolved if clients.empty?
+
+      # A client that never connected reports an error from close; that is
+      # not a reason to abort closing the cluster.
+      Ione::Future.all(*clients.map {|client| client.close.fallback {|_| nil}}).map(nil)
     end
 
     # @private

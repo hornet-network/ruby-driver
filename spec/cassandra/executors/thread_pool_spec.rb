@@ -71,18 +71,34 @@ module Cassandra
       end
 
       describe('#shutdown') do
-        it 'stops the executor' do
-          executed = 0
+        it 'releases the pool threads' do
+          executor.execute { nil }
+          executor.shutdown
+          wait_for { executor.instance_variable_get(:@pool).count(&:alive?) }.to eq(0)
+        end
 
+        it 'runs later tasks on the calling thread instead of dropping them' do
           executor.shutdown
           sleep(0.01)
 
-          10.times do
-            executor.execute { executed += 1}
-            Thread.pass
-          end
+          ran_on = []
+          10.times { executor.execute { ran_on << ::Thread.current } }
 
-          expect(executed).to eq(0)
+          expect(ran_on.size).to eq(10)
+          expect(ran_on.uniq).to eq([::Thread.current])
+        end
+
+        it 'still wakes a thread waiting on a promise resolved after shutdown' do
+          promise = Promise.new(executor)
+          waiter  = ::Thread.new { promise.future.get }
+          wait_for { waiter.status }.to eq('sleep')
+
+          executor.shutdown
+          sleep(0.01)
+          promise.fulfill(:done)
+
+          expect(waiter.join(2)).not_to be_nil
+          expect(waiter.value).to eq(:done)
         end
       end
     end
