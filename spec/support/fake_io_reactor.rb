@@ -39,7 +39,7 @@ class FakeIoReactor
     end
   end
 
-  attr_reader :connections, :last_used_connection
+  attr_reader :connections, :last_used_connection, :timers
   attr_accessor :connection_options
 
   def initialize

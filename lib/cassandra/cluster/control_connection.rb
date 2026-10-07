@@ -25,7 +25,8 @@ module Cassandra
       def initialize(logger, io_reactor, cluster_registry, cluster_schema,
                      cluster_metadata, load_balancing_policy,
                      reconnection_policy, address_resolution_policy, connector,
-                     connection_options, schema_fetcher)
+                     connection_options, schema_fetcher,
+                     contact_points = EMPTY_LIST, name_resolver = ::Resolv)
         @logger                = logger
         @io_reactor            = io_reactor
         @registry              = cluster_registry
@@ -40,6 +41,8 @@ module Cassandra
         @schema_fetcher        = schema_fetcher
         @refreshing_statuses   = ::Hash.new(false)
         @connect_attempt       = nil
+        @contact_points        = contact_points
+        @name_resolver         = name_resolver
         @refresh_schema_future = nil
         @status                = :disconnected
         @refreshing_hosts      = false
@@ -201,10 +204,59 @@ module Cassandra
         f.fallback do |e|
           @logger.error("Control connection failed (#{e.class.name}: #{e.message})")
 
-          return Ione::Future.resolved unless synchronize { @status == :reconnecting }
+          next Ione::Future.resolved unless synchronize { @status == :reconnecting }
 
-          # We're reconnecting...
-          reconnect_async(schedule)
+          if e.is_a?(Errors::NoHostsAvailable)
+            # Every known address failed. The contact points may have moved to
+            # new addresses in DNS; pick those up before the next attempt.
+            refresh_contact_points_async
+              .fallback {|_| nil}
+              .flat_map { reconnect_async(schedule) }
+          else
+            reconnect_async(schedule)
+          end
+        end
+      end
+
+      # Looks the contact-point hostnames up again and registers any address
+      # that is not already known, so the next connect attempt includes it.
+      # Name resolution blocks, so it runs on its own short-lived thread rather
+      # than on the reactor thread, where it would stall every connection.
+      def refresh_contact_points_async
+        return Ione::Future.resolved if @contact_points.empty?
+
+        names    = @contact_points
+        resolver = @name_resolver
+        logger   = @logger
+        promise  = Ione::Promise.new
+
+        ::Thread.new do
+          ::Thread.current.name = 'cassandra_contact_point_lookup'
+          begin
+            addresses = names.flat_map do |name|
+              begin
+                resolver.getaddresses(name)
+              rescue => e
+                logger.warn("Could not resolve contact point #{name} " \
+                  "(#{e.class.name}: #{e.message})")
+                []
+              end
+            end
+            promise.fulfill(addresses)
+          rescue => e
+            promise.fail(e)
+          end
+        end
+
+        promise.future.map do |addresses|
+          addresses.each do |address|
+            ip = ::IPAddr.new(address.to_s)
+            next if @registry.has_host?(ip)
+
+            @logger.info("Contact point resolved to new address #{ip}, adding it")
+            @registry.host_found(ip)
+          end
+          nil
         end
       end
 

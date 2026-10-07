@@ -89,7 +89,9 @@ module Cassandra
                                      address_resolution_policy,
                                      connector,
                                      connection_options,
-                                     schema_fetcher)
+                                     schema_fetcher,
+                                     contact_points,
+                                     name_resolver)
     end
 
     let(:cluster_klass) { Cluster }
@@ -147,6 +149,8 @@ module Cassandra
     end
 
     let(:custom_types)              { [] }
+    let(:contact_points)            { [] }
+    let(:name_resolver)             { ::Resolv }
     let(:port)                      { 9042 }
     let(:protocol_version)          { nil }
     let(:allow_beta_protocol)       { false }

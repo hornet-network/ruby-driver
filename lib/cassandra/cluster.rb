@@ -248,7 +248,12 @@ module Cassandra
             f = session.execute_async("USE #{Util.escape_name(keyspace)}")
 
             f.on_success {promise.fulfill(session)}
-            f.on_failure {|e| promise.break(e)}
+            f.on_failure do |e|
+              # The client is connected by now; without this it would keep its
+              # connection pool, heartbeats and registry listeners alive.
+              client.close
+              promise.break(e)
+            end
           else
             promise.fulfill(session)
           end

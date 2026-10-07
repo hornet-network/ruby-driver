@@ -724,21 +724,31 @@ module Cassandra
       end
     end
 
-    # Get host addresses.
-    hosts = []
+    # Get host addresses. Hostnames are kept as contact points so that the
+    # control connection can look them up again once every known address has
+    # failed, e.g. after a managed service moves to new IPs.
+    hosts          = []
+    contact_points = []
 
     Array(options.fetch(:hosts, '127.0.0.1')).each do |host|
       case host
       when ::IPAddr
         hosts << host
       when ::String # ip address or hostname
-        Resolv.each_address(host) do |ip|
-          hosts << ::IPAddr.new(ip)
+        begin
+          hosts << ::IPAddr.new(host)
+        rescue ::IPAddr::Error
+          contact_points << host
+          Resolv.each_address(host) do |ip|
+            hosts << ::IPAddr.new(ip)
+          end
         end
       else
         raise ::ArgumentError, ":hosts must be String or IPAddr, #{host.inspect} given"
       end
     end
+
+    options[:contact_points] = contact_points.uniq unless contact_points.empty?
 
     if hosts.empty?
       raise ::ArgumentError,

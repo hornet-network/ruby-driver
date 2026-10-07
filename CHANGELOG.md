@@ -10,6 +10,8 @@ Bug Fixes:
 * `Reconnection::Policies::Exponential` accepts a `jitter:` fraction (e.g. `Exponential.new(1, 60, 2, jitter: 0.25)`) so a fleet of processes does not reconnect in lockstep; the ceiling is always honoured, and a start above the max is rejected.
 * A closed control connection rejects further connects instead of half-reopening without its close listeners; a connect that completes after closing started is dropped rather than adopted, no further hosts are tried on a stopping reactor, and only one connect attempt runs at a time so a host-up notification cannot race the reconnect timer into two control connections.
 * A reactor that stops with an error during close is logged instead of reported as a clean close.
+* `Cluster#connect` closes the client it built when the `USE <keyspace>` step fails, instead of leaking its connection pool, heartbeats and registry listeners on every retry.
+* Contact-point hostnames are kept, and once every known address has failed the control connection looks them up again (off the reactor thread) and adds any new address before the next reconnect attempt, so a cluster recovers when its endpoint moves to new IPs.
 * Requires the hornet-network ione fork (>= 1.3.1); the published ione 1.3.0 lacks the reactor fixes and no longer satisfies the gemspec.
 * Reactor restarts restore the wake-up pipe atomically with the start transition, including when shutdown completes during a restart request; shutdown drains use a fixed tick even when timers are overdue.
 * Connection attempts sleep until their nearest deadline, and timers scheduled on the reactor thread avoid redundant wake-ups.

@@ -818,6 +818,49 @@ module Cassandra
               io_reactor.advance_time(reconnect_interval)
               last_connection.should be_connected
             end
+
+            context 'with contact-point hostnames' do
+              let(:name_resolver) { double('name resolver') }
+              let :control_connection do
+                ControlConnection.new(logger, io_reactor, cluster_registry, cluster_schema, cluster_metadata, load_balancing_policy, reconnection_policy, address_resolution_policy, driver.connector, connection_options, schema_fetcher, ['db.example'], name_resolver)
+              end
+
+              it 'looks the names up again and connects to a new address' do
+                expect(name_resolver).to receive(:getaddresses).with('db.example').and_return(['127.0.0.1', '127.0.0.2'])
+
+                io_reactor.advance_time(reconnect_interval)
+
+                await { cluster_registry.has_host?('127.0.0.2') }
+                await { last_connection.connected? && last_connection.host == '127.0.0.2' }
+              end
+
+              it 'keeps reconnecting when the lookup fails' do
+                lookups = 0
+                allow(name_resolver).to receive(:getaddresses).with('db.example') do
+                  lookups += 1
+                  raise ::Resolv::ResolvError, 'no such name'
+                end
+                reschedules = 0
+                allow(reconnection_schedule).to receive(:next) do
+                  reschedules += 1
+                  reconnect_interval
+                end
+
+                io_reactor.advance_time(reconnect_interval)
+                # host status refreshes draw from the same schedule, so only
+                # count what happens after the attempt has failed
+                reschedules_before = reschedules
+
+                # the lookup runs on its own thread; the reconnect is only
+                # rescheduled once it has failed
+                await { lookups == 1 }
+                await { reschedules > reschedules_before }
+
+                io_reactor.node_up('127.0.0.1')
+                io_reactor.advance_time(reconnect_interval)
+                await { last_connection.connected? }
+              end
+            end
           end
         end
 

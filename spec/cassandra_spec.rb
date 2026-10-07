@@ -95,6 +95,12 @@ describe Cassandra do
       it 'should require both or none of username and password' do
         # None
         expect(C.validate({})).to eq({})
+    end
+
+    it 'keeps hostnames as contact points but not ip literals' do
+      allow(Resolv).to receive(:each_address).with('db.example').and_yield('10.0.0.1')
+      expect(C.validate(hosts: ['db.example', '10.0.0.2'])).to eq({ hosts: ['db.example', '10.0.0.2'], contact_points: ['db.example'] })
+      expect(C.validate(hosts: ['10.0.0.2'])).to eq({ hosts: ['10.0.0.2'] })
 
         # Both
         actual = C.validate(username: 'u1', password: 'p1')

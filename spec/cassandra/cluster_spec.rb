@@ -67,6 +67,15 @@ module Cassandra
         cluster.connect_async('foo').get
       end
 
+      it 'closes the client when switching to the keyspace fails' do
+        error = Errors::ClientError.new('USE timed out')
+        Session.stub(:new) { session }
+        expect(session).to receive(:execute_async).once.with('USE foo').and_return(Future::Error.new(error))
+
+        expect { cluster.connect_async('foo').get }.to raise_error(Errors::ClientError, 'USE timed out')
+        expect(cluster_registry).to have(0).listeners
+      end
+
       it 'quotes given keyspace name' do
         future = Future::Value.new(nil)
         Session.stub(:new) { session }
